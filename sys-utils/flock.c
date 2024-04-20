@@ -64,6 +64,8 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(  " -s, --shared             get a shared lock\n"), stdout);
 	fputs(_(  " -x, --exclusive          get an exclusive lock (default)\n"), stdout);
 	fputs(_(  " -u, --unlock             remove a lock\n"), stdout);
+	fputs(_(  " -p, --posix              operate on a POSIX lock instead\n"), stdout);
+	fputs(_(  " -l, --lease              operate on a lease instead\n"), stdout);
 	fputs(_(  " -n, --nonblock           fail rather than wait\n"), stdout);
 	fputs(_(  " -w, --timeout <secs>     wait for a limited amount of time\n"), stdout);
 	fputs(_(  " -E, --conflict-exit-code <number>  exit code after conflict or timeout\n"), stdout);
@@ -132,10 +134,12 @@ int main(int argc, char *argv[])
 	struct itimerval timeout;
 	int have_timeout = 0;
 	int type = LOCK_EX;
+	struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
 	int block = 0;
 	int open_flags = 0;
 	int fd = -1;
-	int opt, ix;
+	int is_lease = 0;
+	int is_posix = 0;
 	int do_close = 0;
 	int no_fork = 0;
 	int status;
@@ -155,6 +159,8 @@ int main(int argc, char *argv[])
 		{"shared", no_argument, NULL, 's'},
 		{"exclusive", no_argument, NULL, 'x'},
 		{"unlock", no_argument, NULL, 'u'},
+		{"posix", no_argument, NULL, 'p'},
+		{"lease", no_argument, NULL, 'l'},
 		{"nonblocking", no_argument, NULL, 'n'},
 		{"nb", no_argument, NULL, 'n'},
 		{"timeout", required_argument, NULL, 'w'},
@@ -183,53 +189,73 @@ int main(int argc, char *argv[])
 	memset(&timeout, 0, sizeof timeout);
 
 	optopt = 0;
-	while ((opt =
-		getopt_long(argc, argv, "+sexnoFuw:E:hV?", long_options,
-			    &ix)) != EOF) {
-		switch (opt) {
+	for (;;) {
+		switch (getopt_long(argc,
+		                    argv,
+		                    "+?E:FVehlnopsuw:x",
+		                    long_options,
+		                    NULL)) {
+		case EOF:
+			break;
+
 		case 's':
 			type = LOCK_SH;
-			break;
+			lock.l_type = F_RDLCK;
+			continue;
 		case 'e':
 		case 'x':
 			type = LOCK_EX;
-			break;
+			lock.l_type = F_WRLCK;
+			continue;
 		case 'u':
 			type = LOCK_UN;
-			break;
+			lock.l_type = F_UNLCK;
+			continue;
+		case 'l':
+			is_lease = 1;
+			continue;
+		case 'p':
+			is_posix = 1;
+			continue;
 		case 'o':
 			do_close = 1;
-			break;
+			continue;
 		case 'F':
 			no_fork = 1;
-			break;
+			continue;
 		case 'n':
 			block = LOCK_NB;
-			break;
+			continue;
 		case 'w':
 			have_timeout = 1;
 			strtotimeval_or_err(optarg, &timeout.it_value,
 				_("invalid timeout value"));
-			break;
+			continue;
 		case 'E':
 			conflict_exit_code = strtos32_or_err(optarg,
 				_("invalid exit code"));
 			if (conflict_exit_code < 0 || conflict_exit_code > 255)
 				errx(EX_USAGE, _("exit code out of range (expected 0 to 255)"));
-			break;
+			continue;
 		case OPT_VERBOSE:
 			verbose = 1;
-			break;
+			continue;
 
 		case 'V':
 			print_version(EX_OK);
+		case '?':
 		case 'h':
 			usage();
 		default:
 			errtryhelp(EX_USAGE);
+			continue;
 		}
+		break;
 	}
 
+	if (is_lease && is_posix)
+		errx(EX_USAGE,
+			_("the --posix and --lease options are incompatible"));
 	if (no_fork && do_close)
 		errx(EX_USAGE,
 			_("the --no-fork and --close options are incompatible"));
@@ -280,7 +306,11 @@ int main(int argc, char *argv[])
 
 	if (verbose)
 		gettime_monotonic(&time_start);
-	while (flock(fd, type | block)) {
+	while (is_lease ? fcntl(fd, F_SETLEASE, lock.l_type) :
+	       is_posix ? fcntl(fd,
+	                        ((const int[]) { F_SETLK, F_SETLKW })[!block],
+	                        &lock)
+	                : flock(fd, type | block)) {
 		switch (errno) {
 		case EWOULDBLOCK:
 			/* -n option set and failed to lock. */
