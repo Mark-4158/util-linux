@@ -47,6 +47,7 @@
 #include "closestream.h"
 #include "monotonic.h"
 #include "timer.h"
+#include "signames.h"
 
 #ifndef F_OFD_GETLK
 #define F_OFD_GETLK	36
@@ -55,8 +56,11 @@
 #endif
 
 enum {
-	API_FLOCK,
-	API_FCNTL_OFD,
+	API_NONE = 0,
+	API_FLOCK = ~API_NONE,
+	API_FCNTL_OFD = LOCK_SH,
+	API_FCNTL_POSIX = LOCK_EX,
+	API_FCNTL_LEASE = LOCK_NB,
 };
 
 static void __attribute__((__noreturn__)) usage(void)
@@ -82,6 +86,8 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(  " -c, --command <command>  run a single command string through the shell\n"), stdout);
 	fputs(_(  " -F, --no-fork            execute command without forking\n"), stdout);
 	fputs(_(  "     --fcntl              use fcntl(F_OFD_SETLK) rather than flock()\n"), stdout);
+	fputs(_(  "     --posix              use fcntl(F_SETLK) rather than flock() (implies --no-fork)\n"), stdout);
+	fputs(_(  "     --lease[=<signal>]   use fcntl(F_SETLEASE) with fcntl(F_SETSIG) rather than flock() (implies --nonblock)\n"), stdout);
 	fputs(_(  "     --verbose            increase verbosity\n"), stdout);
 	fputs(USAGE_SEPARATOR, stdout);
 	fprintf(stdout, USAGE_HELP_OPTIONS(26));
@@ -152,7 +158,7 @@ static int flock_to_fcntl_type(int op)
 	}
 }
 
-static int fcntl_lock(int fd, int op, int block)
+static int do_lock(int api, int fd, int op, int block)
 {
 	struct flock arg = {
 		.l_type = flock_to_fcntl_type(op),
@@ -160,17 +166,24 @@ static int fcntl_lock(int fd, int op, int block)
 		.l_start = 0,
 		.l_len = 0,
 	};
-	int cmd = (block & LOCK_NB) ? F_OFD_SETLK : F_OFD_SETLKW;
-	return fcntl(fd, cmd, &arg);
-}
 
-static int do_lock(int api, int fd, int op, int block)
-{
-	switch (api) {
+	switch (api | block) {
 	case API_FLOCK:
 		return flock(fd, op | block);
+	case API_FCNTL_LEASE | LOCK_NB:
+		return fcntl(fd, F_SETLEASE, arg.l_type);
 	case API_FCNTL_OFD:
-		return fcntl_lock(fd, op, block);
+		op = F_OFD_SETLKW;
+		break;
+	case API_FCNTL_OFD | LOCK_NB:
+		op = F_OFD_SETLK;
+		break;
+	case API_FCNTL_POSIX:
+		op = F_SETLKW;
+		break;
+	case API_FCNTL_POSIX | LOCK_NB:
+		op = F_SETLK;
+		break;
 	/*
 	 * Should never happen, api can never have values other than
 	 * API_*.
@@ -178,6 +191,103 @@ static int do_lock(int api, int fd, int op, int block)
 	default:
 		errx(EX_SOFTWARE, _("internal error, unknown api %d"), api);
 	}
+
+	return fcntl(fd, op, &arg);
+}
+
+static int atosig(const char *tail)
+{
+	static const struct {
+		uint64_t key;
+		int signum;
+	} sigtable[] = {
+		{ 0x425553, SIGBUS },
+		{ 0x465045, SIGFPE },
+		{ 0x485550, SIGHUP },
+		{ 0x494C4C, SIGILL },
+		{ 0x494E54, SIGINT },
+		{ 0x505752, SIGPWR },
+		{ 0x535953, SIGSYS },
+		{ 0x555247, SIGURG },
+		{ 0x41425254, SIGABRT },
+		{ 0x414C524D, SIGALRM },
+		{ 0x43484C44, SIGCHLD },
+		{ 0x434F4E54, SIGCONT },
+		{ 0x4B494C4C, SIGKILL },
+		{ 0x50495045, SIGPIPE },
+		{ 0x504F4C4C, SIGPOLL },
+		{ 0x50524F46, SIGPROF },
+		{ 0x51554954, SIGQUIT },
+		{ 0x53454756, SIGSEGV },
+		{ 0x53544F50, SIGSTOP },
+		{ 0x5445524D, SIGTERM },
+		{ 0x54524150, SIGTRAP },
+		{ 0x54535450, SIGTSTP },
+		{ 0x5454494E, SIGTTIN },
+		{ 0x54544F55, SIGTTOU },
+		{ 0x55535231, SIGUSR1 },
+		{ 0x55535232, SIGUSR2 },
+		{ 0x58435055, SIGXCPU },
+		{ 0x5846535A, SIGXFSZ },
+		{ 0x57494E4348, SIGWINCH },
+		{ 0x53544B464C54, SIGSTKFLT },
+		{ 0x5654414C524D, SIGVTALRM },
+	};
+
+	int ret = 0;
+	uint64_t opt = 0x0;
+
+	if (!strncmp(tail, "SIG", 3)) {
+		tail += 3;
+	}
+
+	while (*tail) {
+		if (isdigit(*tail)) {
+			ret *= 10;
+			ret += *tail++ - '0';
+		} else if (ret) {
+			return 0;
+		} else {
+			opt <<= 8;
+			opt |= *tail++;
+		}
+	}
+
+	if (opt) {
+		if (opt == 0x52544D41582D) {
+			if (ret *= ret < (SIGRTMAX - SIGRTMIN + 1) >> 1) {
+				ret = SIGRTMAX - ret;
+			}
+		} else if (opt == 0x52544D494E2B) {
+			if (ret *= ret <= (SIGRTMAX - SIGRTMIN) >> 1) {
+				ret += SIGRTMIN;
+			}
+		} else {
+			int i = 0;
+			int j = sizeof(sigtable) / sizeof(*sigtable) - 1;
+
+			for (;;/*warnx("atosig(): %2d, %2d, %2d", i, ret, j)*/) {
+				if (sigtable[ret = (i + j) >> 1].key == opt) {
+					ret = sigtable[ret].signum;
+				} else if (ret *= i < j) {
+					if (sigtable[ret].key < opt) {
+						i = ret + 1;
+					} else {
+						j = ret;
+					}
+					continue;
+				} else if (opt == 0x52544D4158) {
+					ret = SIGRTMAX;
+				} else if (opt == 0x52544D494E) {
+					ret = SIGRTMIN;
+				}
+				break;
+			}
+		}
+	}
+
+	//warnx("atosig(): %s!", ret ? "success" : "failure");
+	return ret;
 }
 
 
@@ -195,6 +305,7 @@ int main(int argc, char *argv[])
 	int no_fork = 0;
 	int status;
 	int verbose = 0;
+	int signum = 0;
 	int api = API_FLOCK;
 	struct timeval time_start = { 0 }, time_done = { 0 };
 	/*
@@ -207,6 +318,8 @@ int main(int argc, char *argv[])
 	enum {
 		OPT_VERBOSE = CHAR_MAX + 1,
 		OPT_FCNTL,
+		OPT_POSIX,
+		OPT_LEASE,
 	};
 	static const struct option long_options[] = {
 		{"shared", no_argument, NULL, 's'},
@@ -221,6 +334,8 @@ int main(int argc, char *argv[])
 		{"no-fork", no_argument, NULL, 'F'},
 		{"verbose", no_argument, NULL, OPT_VERBOSE},
 		{"fcntl", no_argument, NULL, OPT_FCNTL},
+		{"posix", no_argument, NULL, OPT_POSIX},
+		{"lease", optional_argument, NULL, OPT_LEASE},
 		{"help", no_argument, NULL, 'h'},
 		{"version", no_argument, NULL, 'V'},
 		{NULL, 0, NULL, 0}
@@ -258,9 +373,18 @@ int main(int argc, char *argv[])
 		case 'o':
 			do_close = 1;
 			break;
+		case OPT_POSIX:
+			api &= API_FCNTL_POSIX;
+			[[fallthrough]];
 		case 'F':
 			no_fork = 1;
 			break;
+		case OPT_LEASE:
+			if (optarg && !(signum = atosig(optarg))) {
+				errx(EX_USAGE, _("%s: invalid signal specification"), optarg);
+			}
+			api &= API_FCNTL_LEASE;
+			[[fallthrough]];
 		case 'n':
 			block = LOCK_NB;
 			break;
@@ -276,7 +400,7 @@ int main(int argc, char *argv[])
 				errx(EX_USAGE, _("exit code out of range (expected 0 to 255)"));
 			break;
 		case OPT_FCNTL:
-			api = API_FCNTL_OFD;
+			api &= API_FCNTL_OFD;
 			break;
 		case OPT_VERBOSE:
 			verbose = 1;
@@ -293,7 +417,10 @@ int main(int argc, char *argv[])
 
 	if (no_fork && do_close)
 		errx(EX_USAGE,
-			_("the --no-fork and --close options are incompatible"));
+			_("--no-fork and --posix are incompatible with --close"));
+	if (!api)
+		errx(EX_USAGE,
+			_("--fcntl, --posix, and --lease are incompatible with each other"));
 
 	/*
 	 * For fcntl(F_OFD_SETLK), an exclusive lock requires that the
@@ -331,6 +458,9 @@ int main(int argc, char *argv[])
 		/* Bad options */
 		errx(EX_USAGE, _("requires file descriptor, file or directory"));
 	}
+
+	if (signum && fcntl(fd, F_SETSIG, signum))
+		errx(EX_USAGE, _("%d: invalid signal number"), signum);
 
 	if (have_timeout) {
 		if (timeout.it_value.tv_sec == 0 &&
